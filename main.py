@@ -1,428 +1,566 @@
-import os
-import logging
-import datetime
-import random
-from telebot import TeleBot, types
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+---
+
+### `main.py`
+
+```python
+import logging
+import os
+import random
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
 
-BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+# Load environment variables
+load_dotenv()
+
+# ===== LOGGING =====
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# ===== CONFIGURATION =====
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    logging.error("TELEGRAM_BOT_TOKEN environment variable not set!")
-    exit(1)
+    raise ValueError("BOT_TOKEN environment variable is not set!")
 
-bot = TeleBot(BOT_TOKEN)
+# ===== DATABASE (In-memory for demo - use PostgreSQL in production) =====
+users_data: Dict[int, Dict] = {}
 
-# Simple in-memory storage (for production, use a database)
-user_data = {}  # user_id: {"bonus": 0, "last_claim": None, "streak": 0, "total_claimed": 0}
-
-# Bonus amounts
-BONUS_RANGES = {"min": 5, "max": 50}
-
-# Streak multipliers
-STREAK_MULTIPLIERS = {
-    0: 1.0, 1: 1.0, 2: 1.1, 3: 1.2, 4: 1.3,
-    5: 1.5, 7: 2.0, 10: 2.5, 15: 3.0, 30: 5.0
-}
-
-# Bonus levels
-BONUS_LEVELS = {
-    0: "⭐ Starter",
-    100: "🥉 Bronze",
-    300: "🥈 Silver",
-    600: "🥇 Gold",
-    1000: "💎 Platinum",
-    1500: "👑 Diamond",
-    2500: "🌟 Legendary"
-}
-
-# --- Helper Functions ---
-
-def get_streak_multiplier(streak):
-    """Get multiplier based on streak length"""
-    if streak >= 30:
-        return STREAK_MULTIPLIERS[30]
-    elif streak >= 15:
-        return STREAK_MULTIPLIERS[15]
-    elif streak >= 10:
-        return STREAK_MULTIPLIERS[10]
-    elif streak >= 7:
-        return STREAK_MULTIPLIERS[7]
-    elif streak >= 5:
-        return STREAK_MULTIPLIERS[5]
-    elif streak >= 3:
-        return STREAK_MULTIPLIERS[3]
-    elif streak >= 2:
-        return STREAK_MULTIPLIERS[2]
-    else:
-        return STREAK_MULTIPLIERS[0]
-
-def get_bonus_level(total_bonus):
-    """Get user level based on total bonus"""
-    level = "⭐ Starter"
-    for threshold, name in sorted(BONUS_LEVELS.items(), reverse=True):
-        if total_bonus >= threshold:
-            level = name
-            break
-    return level
-
-def can_claim_bonus(user_id):
-    """Check if user can claim bonus today"""
-    if user_id not in user_data:
-        return True, None
-    
-    last_claim = user_data[user_id].get("last_claim")
-    if not last_claim:
-        return True, None
-    
-    today = datetime.datetime.now().date()
-    last_date = datetime.datetime.fromisoformat(last_claim).date()
-    
-    if today > last_date:
-        return True, None
-    elif today == last_date:
-        return False, "✅ You already claimed today's bonus!"
-    else:
-        return True, None
-
-def calculate_bonus(user_id):
-    """Calculate bonus amount with streak multiplier"""
-    base_bonus = random.randint(BONUS_RANGES["min"], BONUS_RANGES["max"])
-    streak = user_data.get(user_id, {}).get("streak", 0)
-    multiplier = get_streak_multiplier(streak)
-    bonus = int(base_bonus * multiplier)
-    
-    # Random bonus (15% chance)
-    if random.random() < 0.15:
-        bonus = bonus * 2
-        return bonus, "🎉 DOUBLE BONUS!"
-    
-    return bonus, ""
-
-def format_bonus_message(user_id, bonus_amount, bonus_type):
-    """Format the bonus claiming message"""
-    user_name = user_data[user_id].get("name", "User")
-    total_bonus = user_data[user_id]["bonus"]
-    streak = user_data[user_id]["streak"]
-    level = get_bonus_level(total_bonus)
-    
-    message = (
-        f"🎁 **Daily Bonus Claimed!**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 **User:** {user_name}\n"
-        f"💰 **Bonus:** +{bonus_amount} points\n"
-        f"{bonus_type}\n"
-        f"🔥 **Streak:** {streak} days\n"
-        f"📊 **Total:** {total_bonus} points\n"
-        f"🏅 **Level:** {level}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-    )
-    
-    # Motivational messages
-    if streak >= 30:
-        message += "\n🏆 **LEGENDARY!** 30-day streak!"
-    elif streak >= 15:
-        message += "\n🌟 **AMAZING!** 15 days strong!"
-    elif streak >= 7:
-        message += "\n⭐ **GREAT!** One week streak!"
-    elif streak >= 3:
-        message += "\n💪 **Keep going!**"
-    elif streak == 1:
-        message += "\n🎯 **Day 1!** Come back tomorrow!"
-    
-    return message
-
-def get_leaderboard():
-    """Get top 10 users by bonus"""
-    sorted_users = sorted(user_data.items(), key=lambda x: x[1]["bonus"], reverse=True)
-    return sorted_users[:10]
-
-# --- Command Handlers ---
-
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    """Welcome message"""
-    user_id = message.from_user.id
-    user_name = message.from_user.first_name
-    
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "bonus": 0,
-            "last_claim": None,
+def get_user_data(user_id: int) -> Dict:
+    """Get or create user data."""
+    if user_id not in users_data:
+        users_data[user_id] = {
+            "points": 0,
             "streak": 0,
-            "total_claimed": 0,
-            "name": user_name
+            "first_name": "",
+            "last_bonus_date": None,
+            "bonuses_claimed": 0,
+            "tips_received": [],
         }
+    return users_data[user_id]
+
+# ===== GAMING TIPS =====
+GAMING_TIPS = [
+    "🎯 Practice tracking moving targets in aim trainers for 15 minutes daily.",
+    "🧠 Take a 5-minute break between matches to reset your focus.",
+    "⚙️ Lower your sensitivity gradually for better micro-adjustments.",
+    "📊 Watch your replays to identify positioning mistakes.",
+    "🎮 Warm up with 10 minutes of practice mode before competitive matches.",
+    "🔥 Focus on one skill to improve each week.",
+    "📝 Take notes after each match to track your progress.",
+    "🎯 Keep crosshair at head level at all times.",
+    "🧘 Practice mindfulness during gameplay for better focus.",
+    "⚡ Optimize your settings for higher FPS.",
+    "🎮 Play with a consistent team to build chemistry.",
+    "📈 Track your win rate over time to measure improvement.",
+]
+
+# ===== BONUS REWARDS =====
+BONUS_REWARDS = [
+    "🎁 +10 points",
+    "🎁 +15 points",
+    "🎁 +20 points",
+    "🎁 +25 points",
+    "🎁 +30 points",
+    "🎁 +50 points (🌟 BONUS!)",
+    "🎁 +5 points + a gaming tip",
+    "🎁 +10 points + a special tip",
+]
+
+# ===== KEYBOARDS =====
+
+def get_main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Create the main menu keyboard."""
+    keyboard = [
+        [InlineKeyboardButton("🎁 Claim Daily Bonus", callback_data="bonus")],
+        [InlineKeyboardButton("💡 Gaming Tips", callback_data="tips")],
+        [InlineKeyboardButton("📊 My Stats", callback_data="stats")],
+        [InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_back_menu_keyboard() -> InlineKeyboardMarkup:
+    """Create a keyboard with back to menu button."""
+    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="menu")]]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_stats_keyboard() -> InlineKeyboardMarkup:
+    """Create keyboard for stats page."""
+    keyboard = [
+        [InlineKeyboardButton("🎁 Claim Bonus", callback_data="bonus")],
+        [InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")],
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="menu")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# ===== COMMAND HANDLERS =====
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a welcome message when /start is issued."""
+    user = update.effective_user
+    user_id = user.id
+    first_name = user.first_name or "Player"
     
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        InlineKeyboardButton("🎁 Claim Bonus", callback_data="claim_bonus"),
-        InlineKeyboardButton("📊 My Stats", callback_data="my_stats")
-    )
-    markup.add(
-        InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard"),
-        InlineKeyboardButton("ℹ️ About", callback_data="about")
-    )
+    # Initialize user data
+    user_data = get_user_data(user_id)
+    user_data["first_name"] = first_name
     
-    welcome_text = (
-        f"👋 Welcome, {user_name}!\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎁 **Daily Bonus Bot**\n\n"
-        f"Collect free virtual bonuses daily!\n"
-        f"• 🎁 Daily bonus claims\n"
-        f"• 🔥 Streak multipliers\n"
-        f"• 🏅 Level up system\n"
-        f"• 🏆 Leaderboard competition\n\n"
-        f"**Start earning now:**"
-    )
-    
-    bot.send_message(
-        message.chat.id,
+    welcome_text = f"""🎮 *Welcome to Day2Day Bonus, {first_name}!*
+
+Get daily gaming bonuses, rewards, and tips — completely free!
+
+*Here's what I can do for you:*
+🎁 *Daily Bonus* - Claim your reward every day
+💡 *Gaming Tips* - Improve your skills
+📊 *Track Stats* - Monitor your progress
+🏆 *Leaderboard* - Compete with others
+
+*No gambling. Just rewards for playing smart.* 🎯
+
+Tap a button below to get started!"""
+
+    await update.message.reply_text(
         welcome_text,
-        parse_mode='Markdown',
-        reply_markup=markup
+        reply_markup=get_main_menu_keyboard(),
+        parse_mode="Markdown",
     )
 
-@bot.message_handler(commands=['bonus'])
-def claim_bonus_command(message):
-    """Claim bonus via command"""
-    handle_claim_bonus(message.chat.id, message.from_user.id)
 
-@bot.message_handler(commands=['stats'])
-def stats_command(message):
-    """Show stats via command"""
-    handle_stats(message.chat.id, message.from_user.id)
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a help message when /help is issued."""
+    help_text = """📖 *Day2Day Bonus - Help*
 
-@bot.message_handler(commands=['leaderboard'])
-def leaderboard_command(message):
-    """Show leaderboard via command"""
-    handle_leaderboard(message.chat.id)
+*Commands:*
+/start - Main menu
+/help - This message
+/bonus - Claim your daily bonus
+/stats - Your stats
+/leaderboard - Top players
+/tips - Get gaming tips
 
-@bot.message_handler(commands=['help'])
-def send_help(message):
-    """Help command"""
-    help_text = (
-        "📖 **Commands**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "• `/start` - Main menu\n"
-        "• `/bonus` - Claim daily bonus\n"
-        "• `/stats` - Your stats\n"
-        "• `/leaderboard` - Top users\n"
-        "• `/help` - This message\n\n"
-        "🎁 **How it works:**\n"
-        "Claim daily bonus points\n"
-        "Build streaks for multipliers\n"
-        "Level up through ranks\n"
-        "Compete on leaderboard\n\n"
-        "📌 **No real money. Just fun!**"
+*How it works:*
+1️⃣ Claim your daily bonus
+2️⃣ Earn points and build streaks
+3️⃣ Get gaming tips
+4️⃣ Compete on the leaderboard
+
+*Everything is free - no gambling!* 🎮"""
+
+    await update.message.reply_text(
+        help_text,
+        reply_markup=get_back_menu_keyboard(),
+        parse_mode="Markdown",
     )
-    bot.reply_to(message, help_text, parse_mode='Markdown')
 
-@bot.message_handler(func=lambda message: True)
-def handle_other_messages(message):
-    """Handle any other messages"""
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("📂 Menu", callback_data="start"))
+
+async def bonus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Claim daily bonus."""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    first_name = user_data.get("first_name", update.effective_user.first_name or "Player")
     
-    response = (
-        "💡 **Use commands or buttons:**\n\n"
-        "• `/start` - Main menu\n"
-        "• `/bonus` - Claim bonus\n"
-        "• `/stats` - Your stats\n"
-        "• `/leaderboard` - Top users"
-    )
-    bot.reply_to(message, response, parse_mode='Markdown', reply_markup=markup)
-
-# --- Handler Functions ---
-
-def handle_claim_bonus(chat_id, user_id):
-    """Handle bonus claiming"""
-    if user_id not in user_data:
-        bot.send_message(chat_id, "⚠️ Use /start first!", parse_mode='Markdown')
-        return
+    today = datetime.now().date()
     
-    can_claim, message = can_claim_bonus(user_id)
-    if not can_claim:
-        last_claim = user_data[user_id]["last_claim"]
-        last_date = datetime.datetime.fromisoformat(last_claim).date()
-        next_date = last_date + datetime.timedelta(days=1)
-        
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("📊 My Stats", callback_data="my_stats"))
-        
-        bot.send_message(
-            chat_id,
-            f"⏰ {message}\n"
-            f"📅 **Next bonus:** {next_date.strftime('%B %d, %Y')}",
-            parse_mode='Markdown',
-            reply_markup=markup
+    # Check if already claimed today
+    if user_data.get("last_bonus_date") == today:
+        await update.message.reply_text(
+            f"⏰ *You've already claimed your bonus today, {first_name}!*\n\n"
+            f"Come back tomorrow for another reward. 🌟\n\n"
+            f"📊 Points: {user_data['points']} | Streak: {user_data['streak']} days",
+            reply_markup=get_stats_keyboard(),
+            parse_mode="Markdown",
         )
         return
     
-    bonus_amount, bonus_type = calculate_bonus(user_id)
+    # Calculate bonus
+    bonus_amount = random.randint(5, 30)
     
-    user_data[user_id]["bonus"] += bonus_amount
-    user_data[user_id]["total_claimed"] += bonus_amount
-    user_data[user_id]["last_claim"] = datetime.datetime.now().isoformat()
-    user_data[user_id]["streak"] += 1
-    user_data[user_id]["name"] = user_data[user_id].get("name", "User")
-    
-    result_message = format_bonus_message(user_id, bonus_amount, bonus_type)
-    
-    markup = InlineKeyboardMarkup()
-    markup.add(
-        InlineKeyboardButton("📊 My Stats", callback_data="my_stats"),
-        InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")
-    )
-    markup.add(InlineKeyboardButton("🎁 Claim Again Tomorrow", callback_data="claim_bonus"))
-    
-    bot.send_message(
-        chat_id,
-        result_message,
-        parse_mode='Markdown',
-        reply_markup=markup
-    )
-
-def handle_stats(chat_id, user_id):
-    """Show user stats"""
-    if user_id not in user_data:
-        bot.send_message(chat_id, "⚠️ Use /start first!", parse_mode='Markdown')
-        return
-    
-    data = user_data[user_id]
-    streak = data["streak"]
-    total_bonus = data["bonus"]
-    total_claimed = data["total_claimed"]
-    level = get_bonus_level(total_bonus)
-    multiplier = get_streak_multiplier(streak)
-    
-    sorted_users = sorted(user_data.items(), key=lambda x: x[1]["bonus"], reverse=True)
-    rank = next((i+1 for i, (uid, _) in enumerate(sorted_users) if uid == user_id), "N/A")
-    
-    # Next level progress
-    next_level = None
-    next_threshold = None
-    for threshold, name in sorted(BONUS_LEVELS.items()):
-        if total_bonus < threshold:
-            next_level = name
-            next_threshold = threshold
-            break
-    
-    progress_text = ""
-    if next_level and next_threshold:
-        progress = int((total_bonus / next_threshold) * 100)
-        progress_text = f"📈 **Next Level:** {next_level} ({progress}%)"
-    
-    stats_text = (
-        f"📊 **Your Stats**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 **User:** {data['name']}\n"
-        f"🎁 **Total Bonus:** {total_bonus}\n"
-        f"📈 **Total Claimed:** {total_claimed}\n"
-        f"🏅 **Level:** {level}\n"
-        f"{progress_text}\n"
-        f"🔥 **Streak:** {streak} days\n"
-        f"📈 **Multiplier:** {multiplier}x\n"
-        f"🏆 **Rank:** #{rank} of {len(user_data)}\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
-    )
-    
-    markup = InlineKeyboardMarkup()
-    markup.add(
-        InlineKeyboardButton("🎁 Claim Bonus", callback_data="claim_bonus"),
-        InlineKeyboardButton("🔙 Menu", callback_data="start")
-    )
-    
-    bot.send_message(chat_id, stats_text, parse_mode='Markdown', reply_markup=markup)
-
-def handle_leaderboard(chat_id):
-    """Show leaderboard"""
-    top_users = get_leaderboard()
-    
-    if not top_users:
-        leaderboard_text = "🏆 **Leaderboard**\n━━━━━━━━━━━━━━━━━━━━\n\nNo users yet. Be the first!"
+    # Bonus multipliers for streaks
+    if user_data["streak"] >= 7:
+        bonus_amount = int(bonus_amount * 1.5)
+        bonus_message = "🔥 *7-Day Streak Bonus!* +50% extra!"
+    elif user_data["streak"] >= 3:
+        bonus_amount = int(bonus_amount * 1.2)
+        bonus_message = "⭐ *3-Day Streak Bonus!* +20% extra!"
     else:
-        leaderboard_text = "🏆 **Leaderboard**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        for i, (user_id, data) in enumerate(top_users, 1):
-            medal = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"{i}."
-            name = data.get("name", "User")
-            bonus = data["bonus"]
-            level = get_bonus_level(bonus)
-            streak = data.get("streak", 0)
-            leaderboard_text += f"{medal} **{name}** - {bonus} pts ({level} 🔥{streak}d)\n"
+        bonus_message = "🎁 *Daily Bonus claimed!*"
     
-    markup = InlineKeyboardMarkup()
-    markup.add(
-        InlineKeyboardButton("🎁 Claim Bonus", callback_data="claim_bonus"),
-        InlineKeyboardButton("📊 My Stats", callback_data="my_stats")
+    # Update user data
+    user_data["points"] += bonus_amount
+    user_data["bonuses_claimed"] += 1
+    
+    # Update streak
+    if user_data.get("last_bonus_date") == today - timedelta(days=1):
+        user_data["streak"] += 1
+    else:
+        user_data["streak"] = 1
+    
+    user_data["last_bonus_date"] = today
+    
+    # Random tip to include sometimes
+    tip = random.choice(GAMING_TIPS) if random.random() < 0.3 else None
+    
+    bonus_text = f"""🎉 *Bonus Claimed, {first_name}!*
+
+{bonus_message}
+
+✨ *+{bonus_amount} points earned!*
+📊 Points: {user_data['points']}
+🔥 Streak: {user_data['streak']} days
+📅 Total Bonuses: {user_data['bonuses_claimed']}
+
+{f"💡 *Tip of the day:* {tip}" if tip else "Keep playing smart! 🎮"}"""
+
+    keyboard = [
+        [InlineKeyboardButton("📊 My Stats", callback_data="stats")],
+        [InlineKeyboardButton("💡 More Tips", callback_data="tips")],
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="menu")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        bonus_text,
+        reply_markup=reply_markup,
+        parse_mode="Markdown",
     )
-    markup.add(InlineKeyboardButton("🔙 Menu", callback_data="start"))
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show user stats."""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    first_name = user_data.get("first_name", update.effective_user.first_name or "Player")
     
-    bot.send_message(chat_id, leaderboard_text, parse_mode='Markdown', reply_markup=markup)
+    # Calculate rank
+    sorted_users = sorted(
+        users_data.items(),
+        key=lambda x: x[1]["points"],
+        reverse=True
+    )
+    rank = next(
+        (i + 1 for i, (uid, _) in enumerate(sorted_users) if uid == user_id),
+        len(users_data),
+    )
+    
+    stats_text = f"""📊 *My Stats*
 
-# --- Callback Handlers ---
+👤 Player: {first_name}
+⭐ Points: {user_data['points']}
+🔥 Streak: {user_data['streak']} days
+🎁 Bonuses Claimed: {user_data['bonuses_claimed']}
+🏆 Rank: #{rank} on leaderboard
 
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callback(call):
-    """Handle button clicks"""
-    try:
-        if call.data == "start":
-            send_welcome(call.message)
-            bot.answer_callback_query(call.id)
+Keep claiming your daily bonus! 🎮"""
+
+    await update.message.reply_text(
+        stats_text,
+        reply_markup=get_stats_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show leaderboard."""
+    if not users_data:
+        leaderboard_text = "🏆 *Leaderboard*\n\nNo players yet! Be the first to claim a bonus! 🎮"
+    else:
+        sorted_users = sorted(
+            users_data.items(),
+            key=lambda x: x[1]["points"],
+            reverse=True
+        )
+        
+        leaderboard_text = "🏆 *Leaderboard*\n\n"
+        for i, (user_id, data) in enumerate(sorted_users[:10], 1):
+            first_name = data.get("first_name", f"Player_{str(user_id)[:6]}")
+            points = data["points"]
+            streak = data["streak"]
             
-        elif call.data == "claim_bonus":
-            handle_claim_bonus(call.message.chat.id, call.from_user.id)
-            bot.answer_callback_query(call.id)
-            
-        elif call.data == "my_stats":
-            handle_stats(call.message.chat.id, call.from_user.id)
-            bot.answer_callback_query(call.id)
-            
-        elif call.data == "leaderboard":
-            handle_leaderboard(call.message.chat.id)
-            bot.answer_callback_query(call.id)
-            
-        elif call.data == "about":
-            about_text = (
-                "🤖 **About Daily Bonus**\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                "Free daily virtual bonuses!\n\n"
-                "✅ Claim daily bonuses\n"
-                "✅ Build streaks\n"
-                "✅ Level up through ranks\n"
-                "✅ Compete on leaderboard\n\n"
-                "📌 **No real money**\n"
-                "🎯 **Just for fun!**\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                f"👥 {len(user_data)} users"
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            leaderboard_text += f"{medal} {first_name} - {points} pts ({streak}d)\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("🎁 Claim Bonus", callback_data="bonus")],
+        [InlineKeyboardButton("📊 My Stats", callback_data="stats")],
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="menu")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        leaderboard_text,
+        reply_markup=reply_markup,
+        parse_mode="Markdown",
+    )
+
+
+async def tips_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show gaming tips."""
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    
+    # Get tips user hasn't seen
+    seen_indices = set(user_data.get("tips_received", []))
+    available_tips = [i for i in range(len(GAMING_TIPS)) if i not in seen_indices]
+    
+    if available_tips:
+        tip_index = random.choice(available_tips[:5])  # Pick from first 5 available
+        tip = GAMING_TIPS[tip_index]
+        user_data["tips_received"] = user_data.get("tips_received", []) + [tip_index]
+    else:
+        # Reset and give random tip
+        tip = random.choice(GAMING_TIPS)
+        user_data["tips_received"] = []
+    
+    tips_text = f"""💡 *Gaming Tip*
+
+{tip}
+
+💪 *Pro tip:* Apply this in your next gaming session!
+
+📊 Points: {user_data['points']} | Streak: {user_data['streak']} days
+📚 Tips received: {len(user_data.get('tips_received', []))}"""
+
+    keyboard = [
+        [InlineKeyboardButton("💡 Another Tip", callback_data="tips")],
+        [InlineKeyboardButton("🎁 Claim Bonus", callback_data="bonus")],
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="menu")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        tips_text,
+        reply_markup=reply_markup,
+        parse_mode="Markdown",
+    )
+
+
+# ===== CALLBACK QUERY HANDLERS =====
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle button callbacks."""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    user_id = update.effective_user.id
+    user_data = get_user_data(user_id)
+    first_name = user_data.get("first_name", update.effective_user.first_name or "Player")
+    
+    if data == "menu":
+        welcome_text = f"""🎮 *Welcome back, {first_name}!*
+
+What would you like to do?"""
+        
+        await query.edit_message_text(
+            welcome_text,
+            reply_markup=get_main_menu_keyboard(),
+            parse_mode="Markdown",
+        )
+    
+    elif data == "bonus":
+        today = datetime.now().date()
+        
+        if user_data.get("last_bonus_date") == today:
+            await query.edit_message_text(
+                f"⏰ *You've already claimed your bonus today, {first_name}!*\n\n"
+                f"Come back tomorrow for another reward. 🌟\n\n"
+                f"📊 Points: {user_data['points']} | Streak: {user_data['streak']} days",
+                reply_markup=get_stats_keyboard(),
+                parse_mode="Markdown",
             )
-            markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🔙 Menu", callback_data="start"))
-            
-            bot.edit_message_text(
-                about_text,
-                call.message.chat.id,
-                call.message.message_id,
-                parse_mode='Markdown',
-                reply_markup=markup
+            return
+        
+        # Calculate bonus
+        bonus_amount = random.randint(5, 30)
+        
+        if user_data["streak"] >= 7:
+            bonus_amount = int(bonus_amount * 1.5)
+            bonus_message = "🔥 *7-Day Streak Bonus!* +50% extra!"
+        elif user_data["streak"] >= 3:
+            bonus_amount = int(bonus_amount * 1.2)
+            bonus_message = "⭐ *3-Day Streak Bonus!* +20% extra!"
+        else:
+            bonus_message = "🎁 *Daily Bonus claimed!*"
+        
+        user_data["points"] += bonus_amount
+        user_data["bonuses_claimed"] += 1
+        
+        if user_data.get("last_bonus_date") == today - timedelta(days=1):
+            user_data["streak"] += 1
+        else:
+            user_data["streak"] = 1
+        
+        user_data["last_bonus_date"] = today
+        
+        tip = random.choice(GAMING_TIPS) if random.random() < 0.3 else None
+        
+        bonus_text = f"""🎉 *Bonus Claimed, {first_name}!*
+
+{bonus_message}
+
+✨ *+{bonus_amount} points earned!*
+📊 Points: {user_data['points']}
+🔥 Streak: {user_data['streak']} days
+📅 Total Bonuses: {user_data['bonuses_claimed']}
+
+{f"💡 *Tip of the day:* {tip}" if tip else "Keep playing smart! 🎮"}"""
+        
+        keyboard = [
+            [InlineKeyboardButton("📊 My Stats", callback_data="stats")],
+            [InlineKeyboardButton("💡 More Tips", callback_data="tips")],
+            [InlineKeyboardButton("🔙 Back to Menu", callback_data="menu")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            bonus_text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+    
+    elif data == "stats":
+        sorted_users = sorted(
+            users_data.items(),
+            key=lambda x: x[1]["points"],
+            reverse=True
+        )
+        rank = next(
+            (i + 1 for i, (uid, _) in enumerate(sorted_users) if uid == user_id),
+            len(users_data),
+        )
+        
+        stats_text = f"""📊 *My Stats*
+
+👤 Player: {first_name}
+⭐ Points: {user_data['points']}
+🔥 Streak: {user_data['streak']} days
+🎁 Bonuses Claimed: {user_data['bonuses_claimed']}
+🏆 Rank: #{rank} on leaderboard
+
+Keep claiming your daily bonus! 🎮"""
+        
+        await query.edit_message_text(
+            stats_text,
+            reply_markup=get_stats_keyboard(),
+            parse_mode="Markdown",
+        )
+    
+    elif data == "leaderboard":
+        if not users_data:
+            leaderboard_text = "🏆 *Leaderboard*\n\nNo players yet! Be the first to claim a bonus! 🎮"
+        else:
+            sorted_users = sorted(
+                users_data.items(),
+                key=lambda x: x[1]["points"],
+                reverse=True
             )
-            bot.answer_callback_query(call.id)
             
-    except Exception as e:
-        logging.error(f"Callback error: {e}")
-        bot.answer_callback_query(call.id, text="❌ Error", show_alert=True)
+            leaderboard_text = "🏆 *Leaderboard*\n\n"
+            for i, (uid, data_dict) in enumerate(sorted_users[:10], 1):
+                name = data_dict.get("first_name", f"Player_{str(uid)[:6]}")
+                points = data_dict["points"]
+                streak = data_dict["streak"]
+                
+                medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+                leaderboard_text += f"{medal} {name} - {points} pts ({streak}d)\n"
+        
+        keyboard = [
+            [InlineKeyboardButton("🎁 Claim Bonus", callback_data="bonus")],
+            [InlineKeyboardButton("📊 My Stats", callback_data="stats")],
+            [InlineKeyboardButton("🔙 Back to Menu", callback_data="menu")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            leaderboard_text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+    
+    elif data == "tips":
+        seen_indices = set(user_data.get("tips_received", []))
+        available_tips = [i for i in range(len(GAMING_TIPS)) if i not in seen_indices]
+        
+        if available_tips:
+            tip_index = random.choice(available_tips[:5])
+            tip = GAMING_TIPS[tip_index]
+            user_data["tips_received"] = user_data.get("tips_received", []) + [tip_index]
+        else:
+            tip = random.choice(GAMING_TIPS)
+            user_data["tips_received"] = []
+        
+        tips_text = f"""💡 *Gaming Tip*
 
-# --- Main Execution ---
+{tip}
 
-if __name__ == '__main__':
-    logging.info("🚀 Daily Bonus Bot is starting...")
-    logging.info(f"✅ Bot online! Users: {len(user_data)}")
-    try:
-        bot.infinity_polling(timeout=10, long_polling_timeout=5)
-    except Exception as e:
-        logging.error(f"Bot polling failed: {e}")
+💪 *Pro tip:* Apply this in your next gaming session!
+
+📊 Points: {user_data['points']} | Streak: {user_data['streak']} days
+📚 Tips received: {len(user_data.get('tips_received', []))}"""
+        
+        keyboard = [
+            [InlineKeyboardButton("💡 Another Tip", callback_data="tips")],
+            [InlineKeyboardButton("🎁 Claim Bonus", callback_data="bonus")],
+            [InlineKeyboardButton("🔙 Back to Menu", callback_data="menu")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            tips_text,
+            reply_markup=reply_markup,
+            parse_mode="Markdown",
+        )
+
+
+# ===== ERROR HANDLER =====
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors."""
+    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+
+
+# ===== MAIN FUNCTION =====
+
+def main() -> None:
+    """Start the bot."""
+    # Create the Application
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Register command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("bonus", bonus_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("leaderboard", leaderboard_command))
+    application.add_handler(CommandHandler("tips", tips_command))
+    
+    # Register callback query handler for buttons
+    application.add_handler(CallbackQueryHandler(button_handler))
+    
+    # Register error handler
+    application.add_error_handler(error_handler)
+
+    # Run the bot
+    print("🚀 Day2Day Bonus Bot is running...")
+    print("🤖 Bot username: @day2day_bonusbot")
+    print("📋 Available commands: /start, /help, /bonus, /stats, /leaderboard, /tips")
+    print("⚠️  Press Ctrl+C to stop")
+    
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
